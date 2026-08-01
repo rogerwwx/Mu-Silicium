@@ -9,13 +9,19 @@
  *    cmd 514 READ 8K/4K block -> locate "ANDROID-BOOT!" -> set [13]/[14]=1 ->
  *    cmd 515 WRITE back -> verify re-read.
  *
- *  Path 2 (fallback, mimics stock ABL):
+ *  Path 2 (fallback, mimics stock ABL / VbRwStateApp):
  *    QCOM_VERIFIEDBOOT_PROTOCOL.VBRwDeviceState(READ_CONFIG/WRITE_CONFIG).
  *
- *  Evidence-based constants (SM8550/SM8750 firmware):
+ *  Evidence-based constants (SM8550/SM8750 firmware + VbRwStateApp binary):
  *    514=0x202 READ_KM_DEVICE_STATE, 515=0x203 WRITE_KM_DEVICE_STATE,
  *    8 KiB block (4 KiB on some newer SoCs), 12-byte {cmd_id,buf_ptr,buf_size},
- *    magic "ANDROID-BOOT!" with unlock flags at [13]/[14].
+ *    12-byte response buffer (VerifiedBootDxe passes rbuf_len=12),
+ *    magic "ANDROID-BOOT!" with unlock flags at [13]/[14],
+ *    VB path buffer 0xD10 (3344) - same as VbRwStateApp.
+ *
+ *  NOTE: this is an early-DXE driver (depex = Qseecom protocol), so
+ *  gST->ConOut may not exist yet. All logging goes through DEBUG (serial);
+ *  do NOT use Print() here.
  *
  *  Preconditions:
  *    1. AVB/milestone gate bypassed (no SendMilestone call in your BDS).
@@ -25,17 +31,15 @@
 
 #include <Uefi.h>
 #include <Library/UefiBootServicesTableLib.h>
-#include <Library/UefiLib.h>
 #include <Library/DebugLib.h>
 #include <Library/BaseMemoryLib.h>
 #include <Library/MemoryAllocationLib.h>
-#include <Library/PrintLib.h>
 #include <Protocol/EFIQseecom.h>
 #include <Protocol/EFIVerifiedBoot.h>
 
 // The QcomPkg DEC declares these GUIDs but no source in this tree defines the
 // symbols (TzDxe/VerifiedBootDxe are prebuilt binaries), so define them here
-// locally to keep the app self-contained at link time.
+// locally to keep the module self-contained at link time.
 EFI_GUID mQcomQseecomProtocolGuid = {
   0xA74862CE, 0x680F, 0x4FE1,
   {0xA3, 0x11, 0xDF, 0x41, 0xF4, 0x03, 0x03, 0x91}
@@ -51,7 +55,8 @@ EFI_GUID mQcomVerifiedBootProtocolGuid = {
 
 #define KM_BLOCK_8K                  0x2000
 #define KM_BLOCK_4K                  0x1000
-#define VB_BUF_SIZE                  0xD10  /* 3344: DeviceInfo 0xCA8 + slack */
+#define KM_RESP_SIZE                 12    /* VerifiedBootDxe passes 12 */
+#define VB_BUF_SIZE                  0xD10 /* 3344: same as VbRwStateApp */
 
 #define DI_MAGIC                     "ANDROID-BOOT!"
 #define DI_MAGIC_LEN                 13
@@ -95,18 +100,19 @@ SendDeviceStateCmd (
   )
 {
   KM_DEVICE_STATE_CMD Cmd;
-  UINT32              Resp;
+  UINT32              Resp[KM_RESP_SIZE / sizeof (UINT32)];  /* 12 bytes */
 
   Cmd.CmdId   = CmdId;
   Cmd.BufPtr  = (UINT32)(UINTN)Block;
   Cmd.BufSize = BlockSize;
-  Resp        = 0;
+  ZeroMem (Resp, sizeof (Resp));
+
   return Qseecom->QseecomSendCmd (
                    Qseecom,
                    AppId,
                    (UINT8 *)&Cmd,
                    sizeof (Cmd),
-                   (UINT8 *)&Resp,
+                   (UINT8 *)Resp,
                    sizeof (Resp)
                    );
 }
@@ -141,25 +147,26 @@ UnlockViaQseecom (
   // 1. Qseecom protocol (installed by TzDxe/ScmDxeCompat).
   Status = gBS->LocateProtocol (&mQcomQseecomProtocolGuid, NULL, (VOID **)&Qseecom);
   if (EFI_ERROR (Status) || Qseecom == NULL) {
-    Print (L"KmDeviceStateApp: LocateProtocol(Qseecom) failed: %r\n", Status);
+    DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: LocateProtocol(Qseecom) failed: %r\n", Status));
     return Status;
   }
 
-  // 2. Load the keymaster TA.
+  // 2. Load the keymaster TA ("keymaster" on SM8550/SM8750; "keymaster64" on
+  //    some newer SoCs per atlas PoC).
   Status = EFI_NOT_FOUND;
   for (TaIdx = 0; TaIdx < 2 && EFI_ERROR (Status); TaIdx++) {
     Status = Qseecom->QseecomStartApp (Qseecom, TaNames[TaIdx], &AppId);
     if (!EFI_ERROR (Status)) {
-      Print (L"KmDeviceStateApp: TA '%a' AppId = %u\n", TaNames[TaIdx], AppId);
+      DEBUG ((EFI_D_INFO, "KmDeviceStateApp: TA '%a' AppId = %u\n", TaNames[TaIdx], (UINTN)AppId));
       break;
     }
   }
   if (EFI_ERROR (Status)) {
-    Print (L"KmDeviceStateApp: QseecomStartApp(keymaster*) failed: %r\n", Status);
+    DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: QseecomStartApp(keymaster*) failed: %r\n", Status));
     return Status;
   }
 
-  // 3. READ + patch + WRITE, trying 8 KiB then 4 KiB.
+  // 3. READ + patch + WRITE, trying 8 KiB then 4 KiB (block size varies by SoC).
   MagicFound = FALSE;
   for (SzIdx = 0; SzIdx < 2; SzIdx++) {
     BlockSize = BlockSizes[SzIdx];
@@ -172,7 +179,7 @@ UnlockViaQseecom (
                     &BlockAddr
                     );
     if (EFI_ERROR (Status)) {
-      Print (L"KmDeviceStateApp: alloc %x failed: %r\n", BlockSize, Status);
+      DEBUG ((EFI_D_WARN, "KmDeviceStateApp: alloc %x failed: %r\n", (UINTN)BlockSize, Status));
       continue;
     }
     Block = (UINT8 *)(UINTN)BlockAddr;
@@ -180,7 +187,7 @@ UnlockViaQseecom (
 
     Status = SendDeviceStateCmd (Qseecom, AppId, KM_CMD_READ_DEVICE_STATE, Block, BlockSize);
     if (EFI_ERROR (Status)) {
-      Print (L"KmDeviceStateApp: read cmd 514 (%x block) failed: %r\n", BlockSize, Status);
+      DEBUG ((EFI_D_WARN, "KmDeviceStateApp: read cmd 514 (%x block) failed: %r\n", (UINTN)BlockSize, Status));
       gBS->FreePages (BlockAddr, PageCount);
       Block = NULL;
       continue;
@@ -188,7 +195,7 @@ UnlockViaQseecom (
 
     Di = FindDeviceInfo (Block, BlockSize);
     if (Di == NULL) {
-      Print (L"KmDeviceStateApp: magic not found in %x block\n", BlockSize);
+      DEBUG ((EFI_D_WARN, "KmDeviceStateApp: magic not found in %x block\n", (UINTN)BlockSize));
       gBS->FreePages (BlockAddr, PageCount);
       Block = NULL;
       continue;
@@ -199,19 +206,19 @@ UnlockViaQseecom (
   }
 
   if (!MagicFound || Block == NULL || Di == NULL) {
-    Print (L"KmDeviceStateApp: no readable DeviceInfo block found\n");
+    DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: no readable DeviceInfo block found\n"));
     return EFI_NOT_FOUND;
   }
 
-  Print (L"KmDeviceStateApp: DeviceInfo @ block+0x%x (unlocked=%d critical=%d)\n",
-         (UINTN)(Di - Block), Di[DI_OFF_UNLOCKED], Di[DI_OFF_UNLOCK_CRITICAL]);
+  DEBUG ((EFI_D_INFO, "KmDeviceStateApp: DeviceInfo @ block+0x%x (unlocked=%d critical=%d)\n",
+          (UINTN)(Di - Block), (UINTN)Di[DI_OFF_UNLOCKED], (UINTN)Di[DI_OFF_UNLOCK_CRITICAL]));
   Di[DI_OFF_UNLOCKED]        = 1;  /* is_unlocked */
   Di[DI_OFF_UNLOCK_CRITICAL] = 1;  /* is_unlock_critical */
 
   // 4. WRITE back (whole block, same size as READ).
   Status = SendDeviceStateCmd (Qseecom, AppId, KM_CMD_WRITE_DEVICE_STATE, Block, BlockSize);
   if (EFI_ERROR (Status)) {
-    Print (L"KmDeviceStateApp: write cmd 515 failed: %r\n", Status);
+    DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: write cmd 515 failed: %r\n", Status));
     gBS->FreePages (BlockAddr, PageCount);
     return Status;
   }
@@ -222,15 +229,15 @@ UnlockViaQseecom (
   ZeroMem (Block, BlockSize);
   Status = SendDeviceStateCmd (Qseecom, AppId, KM_CMD_READ_DEVICE_STATE, Block, BlockSize);
   if (EFI_ERROR (Status)) {
-    Print (L"KmDeviceStateApp: verify re-read failed (write already succeeded): %r\n", Status);
+    DEBUG ((EFI_D_WARN, "KmDeviceStateApp: verify re-read failed (write already succeeded): %r\n", Status));
     Status = EFI_SUCCESS;
   } else {
     Di = FindDeviceInfo (Block, BlockSize);
     if (Di != NULL) {
-      Print (L"KmDeviceStateApp: verify unlocked=%d critical=%d\n",
-             Di[DI_OFF_UNLOCKED], Di[DI_OFF_UNLOCK_CRITICAL]);
+      DEBUG ((EFI_D_INFO, "KmDeviceStateApp: verify unlocked=%d critical=%d\n",
+              (UINTN)Di[DI_OFF_UNLOCKED], (UINTN)Di[DI_OFF_UNLOCK_CRITICAL]));
       if (Di[DI_OFF_UNLOCKED] != 1 || Di[DI_OFF_UNLOCK_CRITICAL] != 1) {
-        Print (L"KmDeviceStateApp: VERIFY FAILED (flags not persisted)\n");
+        DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: VERIFY FAILED (flags not persisted)\n"));
         Status = EFI_DEVICE_ERROR;
       }
     }
@@ -241,7 +248,8 @@ UnlockViaQseecom (
 }
 
 // ---------------------------------------------------------------------------
-// Path 2 (fallback): mimic stock ABL - QCOM_VERIFIEDBOOT_PROTOCOL.RWDeviceState
+// Path 2 (fallback): mimic stock ABL / VbRwStateApp -
+//                    QCOM_VERIFIEDBOOT_PROTOCOL.RWDeviceState
 // ---------------------------------------------------------------------------
 static EFI_STATUS
 UnlockViaVerifiedBootProtocol (
@@ -256,38 +264,38 @@ UnlockViaVerifiedBootProtocol (
 
   Status = gBS->LocateProtocol (&mQcomVerifiedBootProtocolGuid, NULL, (VOID **)&Vb);
   if (EFI_ERROR (Status) || Vb == NULL || Vb->VBRwDeviceState == NULL) {
-    Print (L"KmDeviceStateApp: LocateProtocol(VerifiedBoot) failed: %r\n", Status);
+    DEBUG ((EFI_D_WARN, "KmDeviceStateApp: LocateProtocol(VerifiedBoot) failed: %r\n", Status));
     return Status;
   }
 
   Buf = AllocatePool (VB_BUF_SIZE);
   if (Buf == NULL) {
-    Print (L"KmDeviceStateApp: VB path alloc failed\n");
+    DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: VB path alloc failed\n"));
     return EFI_OUT_OF_RESOURCES;
   }
 
   Status = Vb->VBRwDeviceState (Vb, READ_CONFIG, Buf, BufLen);
   if (EFI_ERROR (Status)) {
-    Print (L"KmDeviceStateApp: VB READ_CONFIG failed: %r\n", Status);
+    DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: VB READ_CONFIG failed: %r\n", Status));
     goto Exit;
   }
 
   Di = FindDeviceInfo (Buf, BufLen);
   if (Di == NULL) {
-    Print (L"KmDeviceStateApp: VB path: magic not found\n");
+    DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: VB path: magic not found\n"));
     Status = EFI_NOT_FOUND;
     goto Exit;
   }
-  Print (L"KmDeviceStateApp: VB path: DeviceInfo @ +0x%x (unlocked=%d critical=%d)\n",
-         (UINTN)(Di - Buf), Di[DI_OFF_UNLOCKED], Di[DI_OFF_UNLOCK_CRITICAL]);
+  DEBUG ((EFI_D_INFO, "KmDeviceStateApp: VB path: DeviceInfo @ +0x%x (unlocked=%d critical=%d)\n",
+          (UINTN)(Di - Buf), (UINTN)Di[DI_OFF_UNLOCKED], (UINTN)Di[DI_OFF_UNLOCK_CRITICAL]));
   Di[DI_OFF_UNLOCKED]        = 1;
   Di[DI_OFF_UNLOCK_CRITICAL] = 1;
 
   Status = Vb->VBRwDeviceState (Vb, WRITE_CONFIG, Buf, BufLen);
   if (EFI_ERROR (Status)) {
-    Print (L"KmDeviceStateApp: VB WRITE_CONFIG failed: %r\n", Status);
+    DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: VB WRITE_CONFIG failed: %r\n", Status));
   } else {
-    Print (L"KmDeviceStateApp: VB WRITE_CONFIG success\n");
+    DEBUG ((EFI_D_INFO, "KmDeviceStateApp: VB WRITE_CONFIG success\n"));
   }
 
 Exit:
@@ -309,20 +317,17 @@ KmDeviceStateAppEntry (
 {
   EFI_STATUS Status;
 
-  Print (L"KmDeviceStateApp: start\n");
   DEBUG ((EFI_D_INFO, "KmDeviceStateApp: start (DXE auto-run)\n"));
 
   // Prefer the direct-TA path (only depends on Qseecom protocol).
   Status = UnlockViaQseecom ();
   if (EFI_ERROR (Status)) {
-    Print (L"KmDeviceStateApp: direct TA path failed (%r), trying VB protocol\n", Status);
-    DEBUG ((EFI_D_WARN, "KmDeviceStateApp: direct TA path failed: %r, trying VB protocol\n", Status));
+    DEBUG ((EFI_D_WARN, "KmDeviceStateApp: direct TA path failed (%r), trying VB protocol\n", Status));
     Status = UnlockViaVerifiedBootProtocol ();
   }
 
   if (!EFI_ERROR (Status)) {
-    Print (L"KmDeviceStateApp: unlocked! Reboot to fastboot and run: fastboot -w\n");
-    DEBUG ((EFI_D_INFO, "KmDeviceStateApp: unlocked successfully\n"));
+    DEBUG ((EFI_D_INFO, "KmDeviceStateApp: unlocked successfully (RPMB persisted)\n"));
   } else {
     DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: unlock FAILED: %r\n", Status));
   }

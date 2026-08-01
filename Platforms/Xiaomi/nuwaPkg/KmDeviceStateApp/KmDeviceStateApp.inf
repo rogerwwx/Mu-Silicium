@@ -20,11 +20,9 @@
 [LibraryClasses]
   UefiDriverEntryPoint
   UefiBootServicesTableLib
-  UefiLib
   DebugLib
   BaseMemoryLib
   MemoryAllocationLib
-  PrintLib
 
 [Depex]
   gQcomQseecomProtocolGuid
