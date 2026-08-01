@@ -106,7 +106,7 @@ SendDeviceStateCmd (
                    AppId,
                    (UINT8 *)&Cmd,
                    sizeof (Cmd),
-                   &Resp,
+                   (UINT8 *)&Resp,
                    sizeof (Resp)
                    );
 }
