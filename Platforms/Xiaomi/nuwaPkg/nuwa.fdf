@@ -83,6 +83,9 @@ READ_LOCK_STATUS   = TRUE
   !include Include/DXE.inc
   !include Include/RAW.inc
 
+  # Custom driver: auto-run unlock (keymaster TA 514/515 / VB protocol)
+  INF nuwaPkg/KmDeviceStateApp/KmDeviceStateApp.inf
+
   # RAM Manager
   INF SiliciumPkg/Drivers/RamManagerDxe/RamManagerDxe.inf
 

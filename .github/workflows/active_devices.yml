@@ -28,6 +28,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
       - name: Build UEFI for active devices
         run: bash ./setup_env.sh -p apt && bash ./build_active_devices.sh -r DEBUG
 

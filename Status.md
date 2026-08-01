@@ -1480,7 +1480,7 @@
 
 <img align="right" src="Resources/Pictures/Xiaomi-13-Pro.png" width="350" alt="Preview">
 
-**State:** Inactive <br>
+**State:** Active <br>
 **Codename:** nuwa
 
 **Contributors:** [Robotix](https://github.com/Robotix22/), [Alfa](https://github.com/alfaonyt/)

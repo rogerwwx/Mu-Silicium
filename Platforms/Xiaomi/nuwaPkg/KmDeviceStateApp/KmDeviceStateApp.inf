@@ -1,0 +1,30 @@
+[Defines]
+  INF_VERSION                    = 0x00010005
+  BASE_NAME                      = KmDeviceStateApp
+  FILE_GUID                      = A0E51E2F-4B2A-4D6B-9C4E-3F1E0D8A5C01
+  # DXE_DRIVER: the DXE dispatcher loads and runs it automatically at every
+  # boot (no BDS boot option needed). Depex waits for the Qseecom protocol
+  # installed by TzDxe (ScmDxeCompat/TzDxeLA, APRIORI in this platform).
+  MODULE_TYPE                    = DXE_DRIVER
+  VERSION_STRING                 = 2.0
+  ENTRY_POINT                    = KmDeviceStateAppEntry
+
+[Sources]
+  KmDeviceStateApp.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+  QcomPkg/QcomPkg.dec
+
+[LibraryClasses]
+  UefiDriverEntryPoint
+  UefiBootServicesTableLib
+  UefiLib
+  DebugLib
+  BaseMemoryLib
+  MemoryAllocationLib
+  PrintLib
+
+[Depex]
+  gQcomQseecomProtocolGuid

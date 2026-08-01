@@ -76,3 +76,10 @@
   # QCOM Libraries
   #
   ConfigurationMapLib|nuwaPkg/Library/ConfigurationMapLib/ConfigurationMapLib.inf
+
+[Components]
+  #
+  # Auto-run unlock driver: writes the RPMB DeviceInfo unlock flags
+  # (keymaster TA cmd 514/515, or QCOM_VERIFIEDBOOT_PROTOCOL fallback).
+  #
+  nuwaPkg/KmDeviceStateApp/KmDeviceStateApp.inf
