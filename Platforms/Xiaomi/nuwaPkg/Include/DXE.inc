@@ -15,6 +15,10 @@
   INF Binaries/nuwa/QcomPkg/Drivers/TzDxe/ScmDxeCompat.inf
   INF Binaries/nuwa/QcomPkg/Drivers/TzDxe/TzDxeLA.inf
   INF Binaries/nuwa/QcomPkg/Drivers/PsStateDxe/PsStateDxe.inf
+  # VerifiedBootDxe: installs QCOM_VERIFIEDBOOT_PROTOCOL (entry is protocol
+  # install only; nothing in Mu-Silicium calls VBVerifyImage/SendMilestone).
+  # Enables KmDeviceStateApp's fallback path (VBRwDeviceState WRITE_CONFIG).
+  INF Binaries/nuwa/QcomPkg/Drivers/VerifiedBootDxe/VerifiedBootDxe.inf
 
   INF MdeModulePkg/Universal/WatchdogTimerDxe/WatchdogTimer.inf
   INF MdeModulePkg/Universal/CapsuleRuntimeDxe/CapsuleRuntimeDxe.inf
