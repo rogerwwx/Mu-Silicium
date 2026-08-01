@@ -22,4 +22,8 @@ append_dtb         = true
 # Android Boot Image Configs
 #
 [boot_image]
-header_version = 1
+header_version = 3
+# Match the reference author images (e.g. 8650-ennea.img): v3 header,
+# no ramdisk (empty), Android 13 era OS version metadata.
+os_version     = "13.0.0"
+os_patch_level = "2023-04-05"

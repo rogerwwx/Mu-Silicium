@@ -8,6 +8,7 @@ on:
       - 'Mu_Basecore'
       - 'MuPatches/**'
       - 'Platforms/**'
+      - 'Resources/**'
       - 'Silicon/**'
       - 'Silicium-ACPI'
   workflow_dispatch:
@@ -19,6 +20,7 @@ on:
       - 'Mu_Basecore'
       - 'MuPatches/**'
       - 'Platforms/**'
+      - 'Resources/**'
       - 'Silicon/**'
       - 'Silicium-ACPI'
 env:
