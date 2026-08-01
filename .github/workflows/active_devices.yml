@@ -1,4 +1,4 @@
-name: Build UEFI for active devices
+name: Build UEFI for nuwa
 on:
   push:
     branches: ["main"]
@@ -32,8 +32,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - name: Build UEFI for active devices
-        run: bash ./setup_env.sh -p apt && bash ./build_active_devices.sh -r DEBUG
+      - name: Build UEFI for nuwa
+        run: bash ./setup_env.sh -p apt && python3 ./build_uefi.py -d nuwa -r DEBUG -c -m 0
 
       - name: Upload UEFI images
         uses: actions/upload-artifact@v7
