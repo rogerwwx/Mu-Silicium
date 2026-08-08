@@ -29,8 +29,15 @@ APRIORI DXE {
   INF Binaries/nuwa/QcomPkg/Drivers/VcsDxe/VcsDxe.inf
   INF Binaries/nuwa/QcomPkg/Drivers/ClockDxe/ClockDxe.inf
   INF Binaries/nuwa/QcomPkg/Drivers/ICBDxe/ICBDxe.inf
+
+  # TZ/Qseecom chain (match stock socrates APRIORI ordering so the whole
+  # ShmBridge -> ScmDxeCompat -> TzDxeLA -> Qseecom/keymaster chain comes up
+  # before anything that LocateProtocols it; VerifiedBootDxe installs the VB
+  # protocol used by KmDeviceStateApp's fallback path).
+  INF Binaries/nuwa/QcomPkg/Drivers/VerifiedBootDxe/VerifiedBootDxe.inf
   INF Binaries/nuwa/QcomPkg/Drivers/ShmBridgeDxe/ShmBridgeDxeLA.inf
   INF Binaries/nuwa/QcomPkg/Drivers/TzDxe/ScmDxeCompat.inf
+  INF Binaries/nuwa/QcomPkg/Drivers/TzDxe/TzDxeLA.inf
   INF Binaries/nuwa/QcomPkg/Drivers/TLMMDxe/TLMMDxe.inf
   INF Binaries/nuwa/QcomPkg/Drivers/I2CDxe/I2CDxe.inf
   INF Binaries/nuwa/QcomPkg/Drivers/SPMIDxe/SPMIDxe.inf
@@ -46,7 +53,6 @@ APRIORI DXE {
   INF FatPkg/EnhancedFatDxe/Fat.inf
 
   INF Binaries/nuwa/QcomPkg/Drivers/PmicDxe/PmicDxeLa.inf
-  INF Binaries/nuwa/QcomPkg/Drivers/TzDxe/TzDxeLA.inf
 
   INF MdeModulePkg/Universal/Variable/RuntimeDxe/VariableRuntimeDxe.inf
 

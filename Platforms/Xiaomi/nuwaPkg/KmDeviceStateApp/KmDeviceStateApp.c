@@ -19,9 +19,11 @@
  *    magic "ANDROID-BOOT!" with unlock flags at [13]/[14],
  *    VB path buffer 0xD10 (3344) - same as VbRwStateApp.
  *
- *  NOTE: this is an early-DXE driver (depex = Qseecom protocol), so
- *  gST->ConOut may not exist yet. All logging goes through DEBUG (serial);
- *  do NOT use Print() here.
+ *  NOTE: this driver has NO depex (2026-08-08). It used to depend on the
+ *  Qseecom protocol, but on socrates that protocol is never installed when
+ *  the SMC/TZ chain is down, so the driver never dispatched and produced no
+ *  diagnostics. It now always dispatches (late, after the console is up) and
+ *  prints the state of every link in the TZ chain directly on the screen.
  *
  *  Feedback channel (2026-08-08): the platform renders DEBUG output to the
  *  framebuffer (FrameBufferSerialPortLib), so all results below are printed
@@ -53,6 +55,22 @@ EFI_GUID mQcomQseecomProtocolGuid = {
 EFI_GUID mQcomVerifiedBootProtocolGuid = {
   0x8E5EFF91, 0x21B6, 0x47D3,
   {0xAF, 0x2B, 0xC1, 0x5A, 0x01, 0xE0, 0x20, 0xEC}
+};
+
+// Chain-probe GUIDs (socrates stock, IDA-verified 2026-08-08):
+//   gQcomShmBridgeProtocolGuid (9C1EB71F...) is installed by ShmBridgeDxe and
+//   is the prerequisite that both ScmDxeCompat (ScmArmV8.c:140) and TzDxeLA
+//   (TzeLoaderDxe.c:1115) Locate before they install their own protocols;
+//   gQcomScmProtocolGuid (77ED108D...) is installed by ScmDxeCompat and is
+//   required by TzDxeLA before it installs the Qseecom protocol (A74862CE).
+EFI_GUID mQcomShmBridgeProtocolGuid = {
+  0x9C1EB71F, 0xDD6C, 0x4ED5,
+  {0x9F, 0x6A, 0x5C, 0xC0, 0xCA, 0x78, 0x9F, 0x16}
+};
+
+EFI_GUID mQcomScmProtocolGuid = {
+  0x77ED108D, 0x8524, 0x4B8B,
+  {0x9D, 0x2E, 0x34, 0x98, 0x7A, 0xEC, 0xB9, 0xC1}
 };
 
 #define KM_CMD_READ_DEVICE_STATE    514   /* 0x202 */
@@ -412,6 +430,51 @@ Exit:
 }
 #endif /* !KM_DIAGNOSTIC_ONLY */
 
+#if KM_DIAGNOSTIC_ONLY
+// ---------------------------------------------------------------------------
+// TZ chain probe (2026-08-08): report which links are actually up.
+// On socrates the raw SMC inside ScmDxeCompat failed ("Smc Invoke call failed
+// ret 0x10") and KmDeviceStateApp (depex on Qseecom) never dispatched, so we
+// now check every protocol explicitly instead of relying on the depex.
+// ---------------------------------------------------------------------------
+static VOID
+ProbeTzChain (
+  VOID
+  )
+{
+  EFI_STATUS                    ShmStatus;
+  EFI_STATUS                    ScmStatus;
+  EFI_STATUS                    QseecomStatus;
+  EFI_STATUS                    VbStatus;
+  VOID                         *ShmIf;
+  VOID                         *ScmIf;
+  QCOM_QSEECOM_PROTOCOL        *Qseecom;
+  QCOM_VERIFIEDBOOT_PROTOCOL   *Vb;
+
+  ShmStatus     = gBS->LocateProtocol (&mQcomShmBridgeProtocolGuid, NULL, &ShmIf);
+  ScmStatus     = gBS->LocateProtocol (&mQcomScmProtocolGuid, NULL, &ScmIf);
+  QseecomStatus = gBS->LocateProtocol (&mQcomQseecomProtocolGuid, NULL, (VOID **)&Qseecom);
+  VbStatus      = gBS->LocateProtocol (&mQcomVerifiedBootProtocolGuid, NULL, (VOID **)&Vb);
+
+  DEBUG ((EFI_D_INFO,
+          "KDS probe: ShmBridge=%r SCM=%r Qseecom=%r VerifiedBoot=%r\n",
+          ShmStatus, ScmStatus, QseecomStatus, VbStatus));
+
+  // Mirror on the console so the result is visible without serial.
+  if (gST->ConOut != NULL) {
+    gST->ConOut->OutputString (gST->ConOut, L"KDS probe: ");
+    gST->ConOut->OutputString (gST->ConOut,
+      EFI_ERROR (ShmStatus) ? L"ShmBridge=FAIL " : L"ShmBridge=OK ");
+    gST->ConOut->OutputString (gST->ConOut,
+      EFI_ERROR (ScmStatus) ? L"SCM=FAIL " : L"SCM=OK ");
+    gST->ConOut->OutputString (gST->ConOut,
+      EFI_ERROR (QseecomStatus) ? L"Qseecom=FAIL " : L"Qseecom=OK ");
+    gST->ConOut->OutputString (gST->ConOut,
+      EFI_ERROR (VbStatus) ? L"VerifiedBoot=FAIL\r\n" : L"VerifiedBoot=OK\r\n");
+  }
+}
+#endif /* KM_DIAGNOSTIC_ONLY */
+
 // ---------------------------------------------------------------------------
 // Entry
 // ---------------------------------------------------------------------------
@@ -432,6 +495,10 @@ KmDeviceStateAppEntry (
   // on the screen (no vibration needed).
   DEBUG ((EFI_D_INFO, "KmDeviceStateApp: DIAGNOSTIC MODE (read-only)\n"));
 
+  // Step 1: which links of the TZ/Qseecom chain are installed?
+  ProbeTzChain ();
+
+  // Step 2: can we actually start the keymaster TA and read DeviceInfo?
   Status = ProbeRpmbDeviceState ();
   if (!EFI_ERROR (Status)) {
     DEBUG ((EFI_D_INFO, "KmDeviceStateApp: DIAGNOSTIC OK - flag location confirmed, no write performed\n"));
@@ -439,6 +506,9 @@ KmDeviceStateAppEntry (
   } else {
     DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: DIAGNOSTIC FAILED: %r (no write performed)\n", Status));
   }
+
+  // Keep the probe output on screen for a moment before BDS draws the menu.
+  gBS->Stall (2 * 1000 * 1000);
   return Status;
 #else
   // Prefer the direct-TA path (only depends on Qseecom protocol).
