@@ -94,9 +94,6 @@ READ_LOCK_STATUS   = TRUE
     SECTION RAW = nuwaPkg/RawFiles/uefiplat.cfg
   }
 
-  # Stock socrates panels + PIL config for the prebuilt DisplayDxe/PILDxe.
-  !include Include/ExtraRaw.inc
-
   # Custom driver: auto-run unlock (keymaster TA 514/515 / VB protocol)
   INF nuwaPkg/KmDeviceStateApp/KmDeviceStateApp.inf
 
