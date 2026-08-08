@@ -247,7 +247,7 @@
 
   FILE FREEFORM = 21E9BDD9-6C3F-4F10-84A5-BBEC322741F1 {
     SECTION UI = "uefipil.cfg"
-    SECTION RAW = Binaries/nuwa/RawFiles/uefipil.cfg
+    SECTION RAW = nuwaPkg/RawFiles/uefipil.cfg
   }
 
   FILE FREEFORM = 45FE4B7C-150C-45DA-A021-4BEB2048EC6F {
