@@ -15,6 +15,13 @@
   INF Binaries/nuwa/QcomPkg/Drivers/TzDxe/ScmDxeCompat.inf
   INF Binaries/nuwa/QcomPkg/Drivers/TzDxe/TzDxeLA.inf
   INF Binaries/nuwa/QcomPkg/Drivers/PsStateDxe/PsStateDxe.inf
+  # VerifiedBootDxe: installs QCOM_VERIFIEDBOOT_PROTOCOL (entry is protocol
+  # install only; nothing in Mu-Silicium calls VBVerifyImage/SendMilestone).
+  # Must ALSO be listed here (FV body) - an APRIORI-only entry does NOT add
+  # the module to the FV, and without it KmDeviceStateApp's VB fallback path
+  # LocateProtocol fails with Not Found. The APRIORI entry keeps it dispatched
+  # early (before the TZ chain) so the protocol is ready for the driver.
+  INF Binaries/nuwa/QcomPkg/Drivers/VerifiedBootDxe/VerifiedBootDxe.inf
 
   INF MdeModulePkg/Universal/WatchdogTimerDxe/WatchdogTimer.inf
   INF MdeModulePkg/Universal/CapsuleRuntimeDxe/CapsuleRuntimeDxe.inf

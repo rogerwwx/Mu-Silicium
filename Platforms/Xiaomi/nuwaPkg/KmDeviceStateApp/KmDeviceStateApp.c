@@ -138,21 +138,54 @@ SendDeviceStateCmd (
 {
   KM_DEVICE_STATE_CMD Cmd;
   UINT32              Resp[KM_RESP_SIZE / sizeof (UINT32)];  /* 12 bytes */
+  EFI_STATUS          Status;
 
   Cmd.CmdId   = CmdId;
   Cmd.BufPtr  = (UINT32)(UINTN)Block;
   Cmd.BufSize = BlockSize;
   ZeroMem (Resp, sizeof (Resp));
 
-  return Qseecom->QseecomSendCmd (
-                   Qseecom,
-                   AppId,
-                   (UINT8 *)&Cmd,
-                   sizeof (Cmd),
-                   (UINT8 *)Resp,
-                   sizeof (Resp)
-                   );
+  Status = Qseecom->QseecomSendCmd (
+                     Qseecom,
+                     AppId,
+                     (UINT8 *)&Cmd,
+                     sizeof (Cmd),
+                     (UINT8 *)Resp,
+                     sizeof (Resp)
+                     );
+
+  // The TA's 12-byte response is the actual command status - the EFI_STATUS
+  // return alone is not enough (VerifiedBootDxe checks Resp[2] != 0 as an
+  // error, e.g. "RPMB not provisioned"/"read_req err"). Print all three
+  // dwords so a silent TA-side failure is visible on the framebuffer.
+  DEBUG ((EFI_D_INFO, "KmDeviceStateApp: cmd %u -> Status=%r Resp[0]=0x%x Resp[1]=0x%x Resp[2]=0x%x\n",
+          (UINTN)CmdId, Status, (UINTN)Resp[0], (UINTN)Resp[1], (UINTN)Resp[2]));
+
+  return Status;
 }
+
+#if KM_DIAGNOSTIC_ONLY
+static VOID
+DumpBlockHead (
+  IN UINT8  *Block,
+  IN UINT32 BlockSize
+  )
+{
+  UINTN  Idx;
+  UINT32 Bytes;
+
+  Bytes = (BlockSize < 64) ? BlockSize : 64;
+  DEBUG ((EFI_D_INFO, "KmDeviceStateApp: block head (%u bytes):\n", (UINTN)Bytes));
+  for (Idx = 0; Idx < Bytes; Idx += 16) {
+    DEBUG ((EFI_D_INFO, "  %04x: %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+            (UINTN)Idx,
+            (UINTN)Block[Idx + 0],  (UINTN)Block[Idx + 1],  (UINTN)Block[Idx + 2],  (UINTN)Block[Idx + 3],
+            (UINTN)Block[Idx + 4],  (UINTN)Block[Idx + 5],  (UINTN)Block[Idx + 6],  (UINTN)Block[Idx + 7],
+            (UINTN)Block[Idx + 8],  (UINTN)Block[Idx + 9],  (UINTN)Block[Idx + 10], (UINTN)Block[Idx + 11],
+            (UINTN)Block[Idx + 12], (UINTN)Block[Idx + 13], (UINTN)Block[Idx + 14], (UINTN)Block[Idx + 15]));
+  }
+}
+#endif /* KM_DIAGNOSTIC_ONLY */
 
 // ---------------------------------------------------------------------------
 // Path 1: direct keymaster TA via Qseecom protocol (cmd 514/515)
@@ -322,52 +355,53 @@ ProbeRpmbDeviceState (
     return Status;
   }
 
+  // Probe BOTH TAs x both block sizes so we learn which (if any) actually
+  // returns the DeviceInfo blob (atlas PoC used keymaster64 on SD4Gen2;
+  // VerifiedBootDxe uses "keymaster" here - try both, read-only).
   Status = EFI_NOT_FOUND;
-  for (TaIdx = 0; TaIdx < 2 && EFI_ERROR (Status); TaIdx++) {
+  for (TaIdx = 0; TaIdx < 2; TaIdx++) {
     Status = Qseecom->QseecomStartApp (Qseecom, TaNames[TaIdx], &AppId);
-    if (!EFI_ERROR (Status)) {
-      DEBUG ((EFI_D_INFO, "KmDeviceStateApp: probe: TA '%a' AppId = %u\n", TaNames[TaIdx], (UINTN)AppId));
-      break;
-    }
-  }
-  if (EFI_ERROR (Status)) {
-    DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: probe: QseecomStartApp(keymaster*) failed: %r\n", Status));
-    return Status;
-  }
-
-  for (SzIdx = 0; SzIdx < 2; SzIdx++) {
-    BlockSize = BlockSizes[SzIdx];
-    PageCount = EFI_SIZE_TO_PAGES (BlockSize);
-    BlockAddr = 0xFFFFF000;
-    Status = gBS->AllocatePages (AllocateMaxAddress, EfiRuntimeServicesData, PageCount, &BlockAddr);
     if (EFI_ERROR (Status)) {
-      DEBUG ((EFI_D_WARN, "KmDeviceStateApp: probe: alloc %x failed: %r\n", (UINTN)BlockSize, Status));
+      DEBUG ((EFI_D_WARN, "KmDeviceStateApp: probe: StartApp('%a') failed: %r\n", TaNames[TaIdx], Status));
       continue;
     }
-    Block = (UINT8 *)(UINTN)BlockAddr;
-    ZeroMem (Block, BlockSize);
+    DEBUG ((EFI_D_INFO, "KmDeviceStateApp: probe: TA '%a' AppId = %u\n", TaNames[TaIdx], (UINTN)AppId));
 
-    Status = SendDeviceStateCmd (Qseecom, AppId, KM_CMD_READ_DEVICE_STATE, Block, BlockSize);
-    if (EFI_ERROR (Status)) {
-      DEBUG ((EFI_D_WARN, "KmDeviceStateApp: probe: read cmd 514 (%x block) failed: %r\n", (UINTN)BlockSize, Status));
+    for (SzIdx = 0; SzIdx < 2; SzIdx++) {
+      BlockSize = BlockSizes[SzIdx];
+      PageCount = EFI_SIZE_TO_PAGES (BlockSize);
+      BlockAddr = 0xFFFFF000;
+      Status = gBS->AllocatePages (AllocateMaxAddress, EfiRuntimeServicesData, PageCount, &BlockAddr);
+      if (EFI_ERROR (Status)) {
+        DEBUG ((EFI_D_WARN, "KmDeviceStateApp: probe: alloc %x failed: %r\n", (UINTN)BlockSize, Status));
+        continue;
+      }
+      Block = (UINT8 *)(UINTN)BlockAddr;
+      ZeroMem (Block, BlockSize);
+
+      Status = SendDeviceStateCmd (Qseecom, AppId, KM_CMD_READ_DEVICE_STATE, Block, BlockSize);
+      if (EFI_ERROR (Status)) {
+        DEBUG ((EFI_D_WARN, "KmDeviceStateApp: probe: read cmd 514 (%x block) failed: %r\n", (UINTN)BlockSize, Status));
+        gBS->FreePages (BlockAddr, PageCount);
+        Block = NULL;
+        continue;
+      }
+
+      Di = FindDeviceInfo (Block, BlockSize);
+      if (Di == NULL) {
+        DEBUG ((EFI_D_WARN, "KmDeviceStateApp: probe: magic not found in %x block\n", (UINTN)BlockSize));
+        DumpBlockHead (Block, BlockSize);
+        gBS->FreePages (BlockAddr, PageCount);
+        Block = NULL;
+        continue;
+      }
+
+      DEBUG ((EFI_D_INFO, "KmDeviceStateApp: probe: FOUND DeviceInfo @ +0x%x "
+              "(unlocked=%d critical=%d) - read path OK, no write performed\n",
+              (UINTN)(Di - Block), (UINTN)Di[DI_OFF_UNLOCKED], (UINTN)Di[DI_OFF_UNLOCK_CRITICAL]));
       gBS->FreePages (BlockAddr, PageCount);
-      Block = NULL;
-      continue;
+      return EFI_SUCCESS;
     }
-
-    Di = FindDeviceInfo (Block, BlockSize);
-    if (Di == NULL) {
-      DEBUG ((EFI_D_WARN, "KmDeviceStateApp: probe: magic not found in %x block\n", (UINTN)BlockSize));
-      gBS->FreePages (BlockAddr, PageCount);
-      Block = NULL;
-      continue;
-    }
-
-    DEBUG ((EFI_D_INFO, "KmDeviceStateApp: probe: FOUND DeviceInfo @ +0x%x "
-            "(unlocked=%d critical=%d) - read path OK, no write performed\n",
-            (UINTN)(Di - Block), (UINTN)Di[DI_OFF_UNLOCKED], (UINTN)Di[DI_OFF_UNLOCK_CRITICAL]));
-    gBS->FreePages (BlockAddr, PageCount);
-    return EFI_SUCCESS;
   }
 
   DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: probe: no readable DeviceInfo block found\n"));
@@ -416,6 +450,7 @@ ProbeVerifiedBootPath (
   Di = FindDeviceInfo (Buf, BufLen);
   if (Di == NULL) {
     DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: VB probe: READ_CONFIG ok but magic not found\n"));
+    DumpBlockHead (Buf, BufLen);
     FreePool (Buf);
     return EFI_NOT_FOUND;
   }
