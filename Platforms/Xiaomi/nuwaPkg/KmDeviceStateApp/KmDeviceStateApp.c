@@ -23,16 +23,10 @@
  *  gST->ConOut may not exist yet. All logging goes through DEBUG (serial);
  *  do NOT use Print() here.
  *
- *  Feedback channel (2026-08-07): vibration via the PMIC haptics peripheral.
- *  No haptics protocol exists in the stock 8550/8650/8750 UEFI (PmicDxe only
- *  links the PmicLib *config* parser, there is no HapticsDxe), but the whole
- *  hardware path is already in the platform build: SPMIDxe installs
- *  EFI_SPMI_PROTOCOL and the motor is PM8550B qcom,hv-haptics (SPMI slave 7,
- *  cfg base 0xF000). VibrateSequence() writes a few SPMI registers directly;
- *  a wrong register offset stays inside the haptics peripheral (0xF0xx) so
- *  it cannot touch PMIC power / charger / GPIO registers. Offsets follow the
- *  HV-haptics (HAP530) regmap. Current build is KM_DIAGNOSTIC_ONLY (read-only
- *  probe: 1 buzz loaded / 2 buzzes flag found / 3 buzzes failed).
+ *  Feedback channel (2026-08-08): the platform renders DEBUG output to the
+ *  framebuffer (FrameBufferSerialPortLib), so all results below are printed
+ *  on screen - no vibration needed. Current build is KM_DIAGNOSTIC_ONLY
+ *  (read-only probe; flip to 0 for the full unlock write, see below).
  *
  *  Preconditions:
  *    1. AVB/milestone gate bypassed (no SendMilestone call in your BDS).
@@ -61,44 +55,6 @@ EFI_GUID mQcomVerifiedBootProtocolGuid = {
   {0xAF, 0x2B, 0xC1, 0x5A, 0x01, 0xE0, 0x20, 0xEC}
 };
 
-// EFI_SPMI_PROTOCOL installed by SPMIDxe (GUID read byte-for-byte out of the
-// 8550 stock firmware; interface layout verified by decompiling SPMIDxe and
-// the PmicDxe SPMI wrappers).
-EFI_GUID mQcomSpmiProtocolGuid = {
-  0xFA5F306B, 0xF47D, 0x4AC4,
-  {0xA4, 0x7D, 0x88, 0x2F, 0x82, 0x04, 0xEC, 0x30}
-};
-
-typedef struct _EFI_SPMI_PROTOCOL EFI_SPMI_PROTOCOL;
-
-typedef EFI_STATUS (EFIAPI *EFI_SPMI_READ_BYTE)(
-  IN  EFI_SPMI_PROTOCOL *This,
-  IN  UINT32             SlaveId,
-  IN  UINT32             PeripheralId,
-  IN  UINT32             ByteCount,
-  IN  UINT32             Offset,
-  OUT UINT8              *Data,
-  IN  UINT32             Priority,
-  OUT UINT32             *Status
-  );
-
-typedef EFI_STATUS (EFIAPI *EFI_SPMI_WRITE_BYTE)(
-  IN EFI_SPMI_PROTOCOL *This,
-  IN UINT32             SlaveId,
-  IN UINT32             PeripheralId,
-  IN UINT32             ByteCount,
-  IN UINT32             Offset,
-  IN UINT8              *Data,
-  IN UINT32             Priority
-  );
-
-struct _EFI_SPMI_PROTOCOL {
-  UINT64              Version;   /* 0x10003 on nuwa stock SPMIDxe */
-  EFI_SPMI_READ_BYTE  ReadByte;  /* slot +8  */
-  EFI_SPMI_WRITE_BYTE WriteByte; /* slot +16 */
-  /* ReadMulti / WriteMulti / GetInfo / IRQ slots unused here */
-};
-
 #define KM_CMD_READ_DEVICE_STATE    514   /* 0x202 */
 #define KM_CMD_WRITE_DEVICE_STATE   515   /* 0x203 */
 
@@ -113,46 +69,10 @@ struct _EFI_SPMI_PROTOCOL {
 #define DI_OFF_UNLOCK_CRITICAL       14
 
 /*
- * PM8550B HV-haptics constants (nuwa, SM8550).
- * Source: XBL DTB embedded in the stock FV ->
- *   /soc/qcom,spmi@c42d000/qcom,pm8550b@7/qcom,hv-haptics@f000
- *   (reg = <0xf000> cfg, <0xf100> ptn; qcom,vmax-mv = 0x578 = 1400 mV)
- * 2026-08-08: confirmed 1:1 against the user device's own kernel DT
- *  (qcom,hv-haptics@f000, SPMI slave 7, same reg/vmax; only motor tuning
- *  differs: lra-period-us = 0x1652 -> tlra-ol = 0x477 from own soc dtb).
- * Register offsets: HV-haptics (HAP530) family regmap, upstream
- * qcom-spmi-haptics (PMIH010X) driver.
- */
-#define HAP_PM8550B_SPMI_SLAVE       7u
-#define HAP_CFG_PERIPH_ID            0xF0u  /* 0xF000 >> 8 */
-#define HAP_PTN_PERIPH_ID            0xF1u  /* 0xF100 >> 8 */
-#define HAP_CFG_EN_CTL_REG           0x46u  /* bit7 = haptics enable */
-#define HAP_CFG_VMAX_REG             0x48u  /* vmax_mv / 50 */
-#define HAP_CFG_SPMI_PLAY_REG        0x4Cu  /* bit7 = play; PAT_SRC_DIRECT_PLAY = 1 */
-#define HAP_CFG_AUTORES_CFG_REG      0x63u  /* bit7 = auto-resonance enable */
-#define HAP_CFG_FAULT_CLR_REG        0x66u
-#define HAP_CFG_TLRA_OL_HIGH_REG     0x5Cu  /* LRA resonance period, high nibble */
-#define HAP_CFG_TLRA_OL_LOW_REG      0x5Du  /* LRA resonance period, low byte */
-#define HAP_PTN_DIRECT_PLAY_REG      0x26u  /* amplitude 0..255 */
-
-#define HAP_PLAY_ON                  0x81u  /* PLAY_EN_BIT | PAT_SRC_DIRECT_PLAY */
-#define HAP_FAULT_CLR_ALL            0x17u
-#define HAP_EN_BIT                   0x80u
-#define HAP_AUTORES_EN_BIT           0x80u
-#define HAP_VMAX_MV                  1400u
-#define HAP_VMAX_STEP_MV             50u
-#define HAP_TLRA_OL_TICKS            0x477u /* lra-period-us 0x1652 / 5us per tick */
-#define HAP_AMPLITUDE                128u
-#define HAP_BUZZ_US                  120000u
-#define HAP_PAUSE_US                 150000u
-
-/*
  * Diagnostic-only mode (2026-08-08, user request "先弄个稳妥点的"):
- *   = 1: only READ cmd 514 + magic scan, NEVER writes. Vibration reports:
- *         1 buzz  = driver loaded (and SPMI path works)
- *         2 buzz  = RPMB DeviceInfo magic found (read path OK)
- *         3 buzz  = read failed / magic not found
- *   = 0: full unlock flow (write 515) with 1-buzz success / 3-buzz failure.
+ *   = 1: only READ cmd 514 + magic scan, NEVER writes. Results are printed
+ *        to DEBUG, which the platform renders on the framebuffer.
+ *   = 0: full unlock flow (write 515).
  * Flip this back to 0 once the read path is confirmed on device.
  */
 #define KM_DIAGNOSTIC_ONLY           1
@@ -493,143 +413,6 @@ Exit:
 #endif /* !KM_DIAGNOSTIC_ONLY */
 
 // ---------------------------------------------------------------------------
-// Vibration feedback (PM8550B HV-haptics via EFI_SPMI_PROTOCOL)
-//
-// No driver extraction is needed: SPMIDxe (already in the nuwa build) exposes
-// the SPMI protocol and the haptics peripheral is config-driven. This is the
-// minimal DIRECT_PLAY sequence used by the HV-haptics driver:
-//   enable module -> clear faults -> auto-resonance on -> VMAX ->
-//   TLRA (LRA period, device tuning) -> amplitude (ptn) -> PLAY on -> hold ->
-//   PLAY off.
-// ---------------------------------------------------------------------------
-static EFI_STATUS
-VibrateOnce (
-  IN EFI_SPMI_PROTOCOL *Spmi,
-  IN UINTN              BuzzUs
-  )
-{
-  EFI_STATUS Status;
-  UINT32     SpmiStatus = 0;
-  UINT8      Val;
-
-  if (Spmi == NULL) {
-    return EFI_INVALID_PARAMETER;
-  }
-
-  // 1. Enable haptics module (read-modify-write, keep unrelated bits).
-  Status = Spmi->ReadByte (Spmi, HAP_PM8550B_SPMI_SLAVE, HAP_CFG_PERIPH_ID, 1,
-                           HAP_CFG_EN_CTL_REG, &Val, 0, &SpmiStatus);
-  if (EFI_ERROR (Status)) {
-    goto Exit;
-  }
-  Val |= HAP_EN_BIT;
-  Status = Spmi->WriteByte (Spmi, HAP_PM8550B_SPMI_SLAVE, HAP_CFG_PERIPH_ID, 1,
-                            HAP_CFG_EN_CTL_REG, &Val, 0);
-  if (EFI_ERROR (Status)) {
-    goto Exit;
-  }
-
-  // 2. Clear pending faults.
-  Val = HAP_FAULT_CLR_ALL;
-  Status = Spmi->WriteByte (Spmi, HAP_PM8550B_SPMI_SLAVE, HAP_CFG_PERIPH_ID, 1,
-                            HAP_CFG_FAULT_CLR_REG, &Val, 0);
-  if (EFI_ERROR (Status)) {
-    goto Exit;
-  }
-
-  // 3. Enable auto-resonance (needed by DIRECT_PLAY).
-  Status = Spmi->ReadByte (Spmi, HAP_PM8550B_SPMI_SLAVE, HAP_CFG_PERIPH_ID, 1,
-                           HAP_CFG_AUTORES_CFG_REG, &Val, 0, &SpmiStatus);
-  if (EFI_ERROR (Status)) {
-    goto Exit;
-  }
-  Val |= HAP_AUTORES_EN_BIT;
-  Status = Spmi->WriteByte (Spmi, HAP_PM8550B_SPMI_SLAVE, HAP_CFG_PERIPH_ID, 1,
-                            HAP_CFG_AUTORES_CFG_REG, &Val, 0);
-  if (EFI_ERROR (Status)) {
-    goto Exit;
-  }
-
-  // 4. Drive voltage (vmax_mv / 50 mV per LSB).
-  Val = (UINT8)(HAP_VMAX_MV / HAP_VMAX_STEP_MV);
-  Status = Spmi->WriteByte (Spmi, HAP_PM8550B_SPMI_SLAVE, HAP_CFG_PERIPH_ID, 1,
-                            HAP_CFG_VMAX_REG, &Val, 0);
-  if (EFI_ERROR (Status)) {
-    goto Exit;
-  }
-
-  // 5. LRA resonance period (TLRA) from the device's own tuning:
-  //    lra-period-us = 0x1652 (5714 us) / 5 us per tick = 0x477 ticks.
-  //    PmicDxe never initialises haptics, so write this explicitly.
-  Val = (UINT8)(HAP_TLRA_OL_TICKS >> 8);
-  Status = Spmi->WriteByte (Spmi, HAP_PM8550B_SPMI_SLAVE, HAP_CFG_PERIPH_ID, 1,
-                            HAP_CFG_TLRA_OL_HIGH_REG, &Val, 0);
-  if (EFI_ERROR (Status)) {
-    goto Exit;
-  }
-  Val = (UINT8)(HAP_TLRA_OL_TICKS & 0xFF);
-  Status = Spmi->WriteByte (Spmi, HAP_PM8550B_SPMI_SLAVE, HAP_CFG_PERIPH_ID, 1,
-                            HAP_CFG_TLRA_OL_LOW_REG, &Val, 0);
-  if (EFI_ERROR (Status)) {
-    goto Exit;
-  }
-
-  // 6. Waveform amplitude (constant level, DIRECT_PLAY; PTN peripheral 0xF1).
-  Val = HAP_AMPLITUDE;
-  Status = Spmi->WriteByte (Spmi, HAP_PM8550B_SPMI_SLAVE, HAP_PTN_PERIPH_ID, 1,
-                            HAP_PTN_DIRECT_PLAY_REG, &Val, 0);
-  if (EFI_ERROR (Status)) {
-    goto Exit;
-  }
-
-  // 7. Start playing.
-  Val = HAP_PLAY_ON;
-  Status = Spmi->WriteByte (Spmi, HAP_PM8550B_SPMI_SLAVE, HAP_CFG_PERIPH_ID, 1,
-                            HAP_CFG_SPMI_PLAY_REG, &Val, 0);
-  if (EFI_ERROR (Status)) {
-    goto Exit;
-  }
-
-  // 8. Hold, then stop.
-  gBS->Stall (BuzzUs);
-  Val = 0;
-  Status = Spmi->WriteByte (Spmi, HAP_PM8550B_SPMI_SLAVE, HAP_CFG_PERIPH_ID, 1,
-                            HAP_CFG_SPMI_PLAY_REG, &Val, 0);
-
-Exit:
-  return Status;
-}
-
-static VOID
-VibrateSequence (
-  IN UINTN Buzzes,
-  IN UINTN BuzzUs,
-  IN UINTN PauseUs
-  )
-{
-  EFI_SPMI_PROTOCOL *Spmi = NULL;
-  EFI_STATUS         Status;
-  UINTN              Idx;
-
-  Status = gBS->LocateProtocol (&mQcomSpmiProtocolGuid, NULL, (VOID **)&Spmi);
-  if (EFI_ERROR (Status) || Spmi == NULL) {
-    DEBUG ((EFI_D_WARN, "KmDeviceStateApp: SPMI protocol not found (%r), vibration skipped\n", Status));
-    return;
-  }
-
-  for (Idx = 0; Idx < Buzzes; Idx++) {
-    if (EFI_ERROR (VibrateOnce (Spmi, BuzzUs))) {
-      DEBUG ((EFI_D_WARN, "KmDeviceStateApp: vibration write failed (non-fatal)\n"));
-      break;
-    }
-    if (Idx + 1 < Buzzes) {
-      gBS->Stall (PauseUs);
-    }
-  }
-  DEBUG ((EFI_D_INFO, "KmDeviceStateApp: vibration sequence done (%u buzzes)\n", (UINTN)Buzzes));
-}
-
-// ---------------------------------------------------------------------------
 // Entry
 // ---------------------------------------------------------------------------
 EFI_STATUS
@@ -645,18 +428,15 @@ KmDeviceStateAppEntry (
 
 #if KM_DIAGNOSTIC_ONLY
   // Conservative diagnostic build (user request 2026-08-08): READ-only.
-  //  1 buzz = driver loaded (and SPMI path works)
-  //  2 buzz = RPMB DeviceInfo magic found (flag location confirmed)
-  //  3 buzz = read failed / magic not found
-  VibrateSequence (1, HAP_BUZZ_US, 0);
+  // Results are printed to DEBUG, which FrameBufferSerialPortLib renders
+  // on the screen (no vibration needed).
+  DEBUG ((EFI_D_INFO, "KmDeviceStateApp: DIAGNOSTIC MODE (read-only)\n"));
 
   Status = ProbeRpmbDeviceState ();
   if (!EFI_ERROR (Status)) {
-    VibrateSequence (2, HAP_BUZZ_US, HAP_PAUSE_US);
     DEBUG ((EFI_D_INFO, "KmDeviceStateApp: DIAGNOSTIC OK - flag location confirmed, no write performed\n"));
     Status = EFI_SUCCESS;
   } else {
-    VibrateSequence (3, HAP_BUZZ_US, HAP_PAUSE_US);
     DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: DIAGNOSTIC FAILED: %r (no write performed)\n", Status));
   }
   return Status;
@@ -674,8 +454,6 @@ KmDeviceStateAppEntry (
     DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: unlock FAILED: %r\n", Status));
   }
 
-  // Best-effort physical feedback; never affects the unlock result.
-  VibrateSequence (EFI_ERROR (Status) ? 3 : 1, HAP_BUZZ_US, HAP_PAUSE_US);
   return Status;
 #endif
 }

@@ -83,6 +83,20 @@ READ_LOCK_STATUS   = TRUE
   !include Include/DXE.inc
   !include Include/RAW.inc
 
+  # Platform config consumed by the stock EnvDxe / DDRInfoDxe binaries:
+  # without this freeform file EnvDxe cannot find the "CPU Vectors" region
+  # and asserts (AutoGen.c:607, Status = Not Found). Content is generated
+  # from nuwaPkg/Library/MemoryMapLib/MemoryMapLib.c so it matches the
+  # compiled-in memory map; [ConfigParameters] follows the stock socrates
+  # (Redmi K60 Pro) uefiplat.cfg.
+  FILE FREEFORM = DDE58710-41CD-4306-DBFB-3FA90BB1D2DD {
+    SECTION UI = "uefiplat.cfg"
+    SECTION RAW = nuwaPkg/RawFiles/uefiplat.cfg
+  }
+
+  # Stock socrates panels + PIL config for the prebuilt DisplayDxe/PILDxe.
+  !include Include/ExtraRaw.inc
+
   # Custom driver: auto-run unlock (keymaster TA 514/515 / VB protocol)
   INF nuwaPkg/KmDeviceStateApp/KmDeviceStateApp.inf
 
