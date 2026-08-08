@@ -169,6 +169,62 @@ def handle_git_patch (submodule_path: Path, patch_name: str, remove: bool) -> bo
     # Apply/Undo Path
     return subprocess.run (cmd, cwd=submodule_path).returncode == 0
 
+
+#
+# TzDxeLA "patched" fix (2026-08-08, IDA-verified):
+#   Device-Binaries ships nuwa TzDxeLA.patched.efi with a one-byte .data
+#   pre-init at file offset 0xE4FC (VA 0xE4FC, byte_E4FC in StartApp):
+#       0x01 = "Qseecom already initialized" -> StartApp SKIPS sub_3008,
+#              which is the init that loads the keymaster TA (per
+#              SecurityFlag bit 0x80). Result: QseecomStartApp("keymaster")
+#              fails with TZ result 0xE (Not Found) and the 514/515 RPMB
+#              unlock path can never work.
+#       0x00 = run init on first StartApp (stock behaviour).
+#   Verified against: socrates stock BOOT.MXF TzDxeLA.efi and the working
+#   8550-kernel TzDxe (both byte-identical, E4FC=0x00). The patched file is
+#   the ONLY difference (SHA diff = exactly 1 byte).
+#
+TZDXE_PATCHED_PATH     = Path ("Binaries/nuwa/QcomPkg/Drivers/TzDxe/TzDxeLA.patched.efi")
+TZDXE_FIX_OFFSET       = 0xE4FC
+TZDXE_FIX_PATCHED_VAL  = 0x01
+TZDXE_FIX_STOCK_VAL    = 0x00
+
+
+def fix_tzdxe_keymaster_init () -> bool:
+    # Verify the File Exists
+    if not TZDXE_PATCHED_PATH.is_file ():
+        logger.warning (f"TzDxeLA.patched.efi not found at \"{TZDXE_PATCHED_PATH}\"")
+        return False
+
+    # Read the File
+    tzdxe_data = bytearray (TZDXE_PATCHED_PATH.read_bytes ())
+    if len (tzdxe_data) <= TZDXE_FIX_OFFSET:
+        logger.warning ("TzDxeLA.patched.efi is too small, cannot apply keymaster init fix")
+        return False
+
+    # Already Fixed
+    if tzdxe_data[TZDXE_FIX_OFFSET] == TZDXE_FIX_STOCK_VAL:
+        logger.info ("TzDxeLA keymaster init fix already applied (E4FC=0x00)")
+        return True
+
+    # Unexpected Byte
+    if tzdxe_data[TZDXE_FIX_OFFSET] != TZDXE_FIX_PATCHED_VAL:
+        logger.warning (
+            f"Unexpected byte at TzDxeLA offset {TZDXE_FIX_OFFSET:#x}: "
+            f"{tzdxe_data[TZDXE_FIX_OFFSET]:#x} (expected {TZDXE_FIX_PATCHED_VAL:#x} or {TZDXE_FIX_STOCK_VAL:#x})"
+        )
+        return False
+
+    # Flip the Flag Back to Stock
+    tzdxe_data[TZDXE_FIX_OFFSET] = TZDXE_FIX_STOCK_VAL
+    TZDXE_PATCHED_PATH.write_bytes (bytes (tzdxe_data))
+    logger.info (
+        "Patched TzDxeLA E4FC 0x01 -> 0x00 "
+        "(restore Qseecom init so the keymaster TA is loaded; enables the "
+        "514/515 RPMB unlock path)"
+    )
+    return True
+
 def update_local_repo () -> bool:
     # Pull Latest Changes
     if not subprocess.run (["git", "pull"]).returncode == 0:
@@ -496,6 +552,13 @@ def main ():
     if boot_shim_present:
         if not compile_boot_shim (config_data.get ("boot_shim"), config_data.get ("uefi_fd")):
             sys.exit (1)
+
+    # Fix the "patched" TzDxeLA so the keymaster TA actually loads
+    # (Device-Binaries nuwa ships byte_E4FC pre-set to 1, which skips the
+    # Qseecom init; without the keymaster TA the 514/515 RPMB unlock path
+    # fails with TZ result 0xE on device).
+    if not fix_tzdxe_keymaster_init ():
+        sys.exit (1)
 
     # Prepare UEFI Environment
     if not prepare_uefi_environment (device_script_path, ctx.build_mode, ctx.update):

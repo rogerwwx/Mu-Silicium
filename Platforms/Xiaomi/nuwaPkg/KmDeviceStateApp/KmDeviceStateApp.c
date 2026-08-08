@@ -41,6 +41,7 @@
 #include <Library/DebugLib.h>
 #include <Library/BaseMemoryLib.h>
 #include <Library/MemoryAllocationLib.h>
+#include <Library/PrintLib.h>
 #include <Protocol/EFIQseecom.h>
 #include <Protocol/EFIVerifiedBoot.h>
 
@@ -85,6 +86,10 @@ EFI_GUID mQcomScmProtocolGuid = {
 #define DI_MAGIC_LEN                 13
 #define DI_OFF_UNLOCKED              13
 #define DI_OFF_UNLOCK_CRITICAL       14
+
+/* How long (us) the diagnostic summary stays on screen before BDS draws the
+ * boot menu. 5 seconds so the result is actually readable on the framebuffer. */
+#define KM_DIAG_SCREEN_STALL_US      5000 * 1000
 
 /*
  * Diagnostic-only mode (2026-08-08, user request "先弄个稳妥点的"):
@@ -368,6 +373,59 @@ ProbeRpmbDeviceState (
   DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: probe: no readable DeviceInfo block found\n"));
   return EFI_NOT_FOUND;
 }
+
+// ---------------------------------------------------------------------------
+// Diagnostic probe #2: VerifiedBoot protocol READ_CONFIG (read-only).
+// VerifiedBootDxe's VBRwDeviceState mirrors what stock ABL does: on a secure
+// device with SecurityFlag bit 0x80 it reads via keymaster/RPMB (cmd 514),
+// otherwise it falls back to the "devinfo" GPT partition. With the TzDxeLA
+// keymaster-init fix both paths should succeed; this probe reports which one
+// actually worked on the device.
+// ---------------------------------------------------------------------------
+static EFI_STATUS
+ProbeVerifiedBootPath (
+  VOID
+  )
+{
+  EFI_STATUS                  Status;
+  QCOM_VERIFIEDBOOT_PROTOCOL *Vb     = NULL;
+  UINT8                      *Buf    = NULL;
+  UINT8                      *Di     = NULL;
+  UINT32                      BufLen = VB_BUF_SIZE;
+
+  Status = gBS->LocateProtocol (&mQcomVerifiedBootProtocolGuid, NULL, (VOID **)&Vb);
+  if (EFI_ERROR (Status) || Vb == NULL || Vb->VBRwDeviceState == NULL) {
+    DEBUG ((EFI_D_WARN, "KmDeviceStateApp: VB probe: LocateProtocol(VerifiedBoot) failed: %r\n", Status));
+    return Status;
+  }
+
+  Buf = AllocatePool (VB_BUF_SIZE);
+  if (Buf == NULL) {
+    DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: VB probe: alloc failed\n"));
+    return EFI_OUT_OF_RESOURCES;
+  }
+  ZeroMem (Buf, BufLen);
+
+  Status = Vb->VBRwDeviceState (Vb, READ_CONFIG, Buf, BufLen);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: VB probe: READ_CONFIG failed: %r\n", Status));
+    FreePool (Buf);
+    return Status;
+  }
+
+  Di = FindDeviceInfo (Buf, BufLen);
+  if (Di == NULL) {
+    DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: VB probe: READ_CONFIG ok but magic not found\n"));
+    FreePool (Buf);
+    return EFI_NOT_FOUND;
+  }
+
+  DEBUG ((EFI_D_INFO, "KmDeviceStateApp: VB probe: FOUND DeviceInfo @ +0x%x "
+          "(unlocked=%d critical=%d) - VB READ path OK, no write performed\n",
+          (UINTN)(Di - Buf), (UINTN)Di[DI_OFF_UNLOCKED], (UINTN)Di[DI_OFF_UNLOCK_CRITICAL]));
+  FreePool (Buf);
+  return EFI_SUCCESS;
+}
 #endif /* KM_DIAGNOSTIC_ONLY */
 
 // ---------------------------------------------------------------------------
@@ -507,8 +565,33 @@ KmDeviceStateAppEntry (
     DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: DIAGNOSTIC FAILED: %r (no write performed)\n", Status));
   }
 
-  // Keep the probe output on screen for a moment before BDS draws the menu.
-  gBS->Stall (2 * 1000 * 1000);
+  // Step 3: VerifiedBoot protocol READ_CONFIG (read-only). Reports whether the
+  // ABL-mirroring VB path can also read DeviceInfo (RPMB or devinfo fallback).
+  {
+    EFI_STATUS VbStatus;
+
+    VbStatus = ProbeVerifiedBootPath ();
+    if (!EFI_ERROR (VbStatus)) {
+      DEBUG ((EFI_D_INFO, "KmDeviceStateApp: VB DIAGNOSTIC OK - VB READ path works, no write performed\n"));
+    } else {
+      DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: VB DIAGNOSTIC FAILED: %r (no write performed)\n", VbStatus));
+    }
+
+    // Mirror the final result on the framebuffer (no serial needed).
+    if (gST->ConOut != NULL) {
+      CHAR16 Summary[128];
+
+      UnicodeSPrint (
+        Summary, sizeof (Summary),
+        L"KDS: Qseecom=%s VB=%s\r\n",
+        EFI_ERROR (Status)   ? L"FAIL" : L"OK",
+        EFI_ERROR (VbStatus) ? L"FAIL" : L"OK");
+      gST->ConOut->OutputString (gST->ConOut, Summary);
+    }
+  }
+
+  // Keep the probe output on screen (5 s) before BDS draws the menu.
+  gBS->Stall (KM_DIAG_SCREEN_STALL_US);
   return Status;
 #else
   // Prefer the direct-TA path (only depends on Qseecom protocol).

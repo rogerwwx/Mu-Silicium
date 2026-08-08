@@ -27,6 +27,7 @@
   DebugLib
   BaseMemoryLib
   MemoryAllocationLib
+  PrintLib
 
 [Depex]
   TRUE

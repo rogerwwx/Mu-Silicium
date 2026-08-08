@@ -11,6 +11,9 @@ on:
       - 'Resources/**'
       - 'Silicon/**'
       - 'Silicium-ACPI'
+      - 'build_uefi.py'
+      - 'setup_env.sh'
+      - '.github/workflows/**'
   workflow_dispatch:
   pull_request:
     types: [opened, reopened]
@@ -23,6 +26,9 @@ on:
       - 'Resources/**'
       - 'Silicon/**'
       - 'Silicium-ACPI'
+      - 'build_uefi.py'
+      - 'setup_env.sh'
+      - '.github/workflows/**'
 env:
   CI_BUILD: true
 jobs:
