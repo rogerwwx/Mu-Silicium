@@ -104,7 +104,7 @@ EFI_GUID mQcomScmProtocolGuid = {
 
 /* How long (us) the diagnostic summary stays on screen before BDS draws the
  * boot menu. 5 seconds so the result is actually readable on the framebuffer. */
-#define KM_DIAG_SCREEN_STALL_US      5000 * 1000
+#define KM_DIAG_SCREEN_STALL_US      10 * 1000 * 1000
 
 /*
  * Diagnostic-only mode (2026-08-08):
