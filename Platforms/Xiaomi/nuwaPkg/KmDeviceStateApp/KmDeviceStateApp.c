@@ -28,10 +28,11 @@
  *  links the PmicLib *config* parser, there is no HapticsDxe), but the whole
  *  hardware path is already in the platform build: SPMIDxe installs
  *  EFI_SPMI_PROTOCOL and the motor is PM8550B qcom,hv-haptics (SPMI slave 7,
- *  cfg base 0xF000). VibrateFeedback() writes a few SPMI registers directly
- *  (success = 1 buzz, failure = 3 buzzes); a wrong register offset stays
- *  inside the haptics peripheral (0xF0xx) so it cannot touch PMIC power /
- *  charger / GPIO registers. Offsets follow the HV-haptics (HAP530) regmap.
+ *  cfg base 0xF000). VibrateSequence() writes a few SPMI registers directly;
+ *  a wrong register offset stays inside the haptics peripheral (0xF0xx) so
+ *  it cannot touch PMIC power / charger / GPIO registers. Offsets follow the
+ *  HV-haptics (HAP530) regmap. Current build is KM_DIAGNOSTIC_ONLY (read-only
+ *  probe: 1 buzz loaded / 2 buzzes flag found / 3 buzzes failed).
  *
  *  Preconditions:
  *    1. AVB/milestone gate bypassed (no SendMilestone call in your BDS).
@@ -145,6 +146,17 @@ struct _EFI_SPMI_PROTOCOL {
 #define HAP_BUZZ_US                  120000u
 #define HAP_PAUSE_US                 150000u
 
+/*
+ * Diagnostic-only mode (2026-08-08, user request "先弄个稳妥点的"):
+ *   = 1: only READ cmd 514 + magic scan, NEVER writes. Vibration reports:
+ *         1 buzz  = driver loaded (and SPMI path works)
+ *         2 buzz  = RPMB DeviceInfo magic found (read path OK)
+ *         3 buzz  = read failed / magic not found
+ *   = 0: full unlock flow (write 515) with 1-buzz success / 3-buzz failure.
+ * Flip this back to 0 once the read path is confirmed on device.
+ */
+#define KM_DIAGNOSTIC_ONLY           1
+
 // 12-byte command structure observed in VerifiedBootDxe:
 // {cmd_id, buf_ptr(32-bit), buf_size}. Buffer must be below 4 GB.
 #pragma pack(push, 1)
@@ -202,6 +214,7 @@ SendDeviceStateCmd (
 // ---------------------------------------------------------------------------
 // Path 1: direct keymaster TA via Qseecom protocol (cmd 514/515)
 // ---------------------------------------------------------------------------
+#if !KM_DIAGNOSTIC_ONLY
 static EFI_STATUS
 UnlockViaQseecom (
   VOID
@@ -328,11 +341,102 @@ UnlockViaQseecom (
   gBS->FreePages (BlockAddr, PageCount);
   return Status;
 }
+#endif /* !KM_DIAGNOSTIC_ONLY */
+
+// ---------------------------------------------------------------------------
+// Diagnostic probe (KM_DIAGNOSTIC_ONLY): READ-only verification.
+// Same read path as UnlockViaQseecom (TA load + cmd 514), but NEVER writes.
+// Returns EFI_SUCCESS when the DeviceInfo magic is found, so the caller can
+// report "RPMB readable and flag location confirmed" via vibration.
+// ---------------------------------------------------------------------------
+#if KM_DIAGNOSTIC_ONLY
+static EFI_STATUS
+ProbeRpmbDeviceState (
+  VOID
+  )
+{
+  EFI_STATUS             Status;
+  QCOM_QSEECOM_PROTOCOL *Qseecom = NULL;
+  UINT32                 AppId   = 0;
+  CHAR8                 *TaNames[2];
+  UINT32                 BlockSizes[2];
+  UINTN                  TaIdx;
+  UINTN                  SzIdx;
+  UINTN                  PageCount;
+  UINT32                 BlockSize;
+  EFI_PHYSICAL_ADDRESS   BlockAddr;
+  UINT8                 *Block = NULL;
+  UINT8                 *Di    = NULL;
+
+  TaNames[0]    = "keymaster";
+  TaNames[1]    = "keymaster64";
+  BlockSizes[0] = KM_BLOCK_8K;
+  BlockSizes[1] = KM_BLOCK_4K;
+
+  Status = gBS->LocateProtocol (&mQcomQseecomProtocolGuid, NULL, (VOID **)&Qseecom);
+  if (EFI_ERROR (Status) || Qseecom == NULL) {
+    DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: probe: LocateProtocol(Qseecom) failed: %r\n", Status));
+    return Status;
+  }
+
+  Status = EFI_NOT_FOUND;
+  for (TaIdx = 0; TaIdx < 2 && EFI_ERROR (Status); TaIdx++) {
+    Status = Qseecom->QseecomStartApp (Qseecom, TaNames[TaIdx], &AppId);
+    if (!EFI_ERROR (Status)) {
+      DEBUG ((EFI_D_INFO, "KmDeviceStateApp: probe: TA '%a' AppId = %u\n", TaNames[TaIdx], (UINTN)AppId));
+      break;
+    }
+  }
+  if (EFI_ERROR (Status)) {
+    DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: probe: QseecomStartApp(keymaster*) failed: %r\n", Status));
+    return Status;
+  }
+
+  for (SzIdx = 0; SzIdx < 2; SzIdx++) {
+    BlockSize = BlockSizes[SzIdx];
+    PageCount = EFI_SIZE_TO_PAGES (BlockSize);
+    BlockAddr = 0xFFFFF000;
+    Status = gBS->AllocatePages (AllocateMaxAddress, EfiRuntimeServicesData, PageCount, &BlockAddr);
+    if (EFI_ERROR (Status)) {
+      DEBUG ((EFI_D_WARN, "KmDeviceStateApp: probe: alloc %x failed: %r\n", (UINTN)BlockSize, Status));
+      continue;
+    }
+    Block = (UINT8 *)(UINTN)BlockAddr;
+    ZeroMem (Block, BlockSize);
+
+    Status = SendDeviceStateCmd (Qseecom, AppId, KM_CMD_READ_DEVICE_STATE, Block, BlockSize);
+    if (EFI_ERROR (Status)) {
+      DEBUG ((EFI_D_WARN, "KmDeviceStateApp: probe: read cmd 514 (%x block) failed: %r\n", (UINTN)BlockSize, Status));
+      gBS->FreePages (BlockAddr, PageCount);
+      Block = NULL;
+      continue;
+    }
+
+    Di = FindDeviceInfo (Block, BlockSize);
+    if (Di == NULL) {
+      DEBUG ((EFI_D_WARN, "KmDeviceStateApp: probe: magic not found in %x block\n", (UINTN)BlockSize));
+      gBS->FreePages (BlockAddr, PageCount);
+      Block = NULL;
+      continue;
+    }
+
+    DEBUG ((EFI_D_INFO, "KmDeviceStateApp: probe: FOUND DeviceInfo @ +0x%x "
+            "(unlocked=%d critical=%d) - read path OK, no write performed\n",
+            (UINTN)(Di - Block), (UINTN)Di[DI_OFF_UNLOCKED], (UINTN)Di[DI_OFF_UNLOCK_CRITICAL]));
+    gBS->FreePages (BlockAddr, PageCount);
+    return EFI_SUCCESS;
+  }
+
+  DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: probe: no readable DeviceInfo block found\n"));
+  return EFI_NOT_FOUND;
+}
+#endif /* KM_DIAGNOSTIC_ONLY */
 
 // ---------------------------------------------------------------------------
 // Path 2 (fallback): mimic stock ABL / VbRwStateApp -
 //                    QCOM_VERIFIEDBOOT_PROTOCOL.RWDeviceState
 // ---------------------------------------------------------------------------
+#if !KM_DIAGNOSTIC_ONLY
 static EFI_STATUS
 UnlockViaVerifiedBootProtocol (
   VOID
@@ -386,6 +490,7 @@ Exit:
   }
   return Status;
 }
+#endif /* !KM_DIAGNOSTIC_ONLY */
 
 // ---------------------------------------------------------------------------
 // Vibration feedback (PM8550B HV-haptics via EFI_SPMI_PROTOCOL)
@@ -496,13 +601,14 @@ Exit:
 }
 
 static VOID
-VibrateFeedback (
-  IN BOOLEAN Success
+VibrateSequence (
+  IN UINTN Buzzes,
+  IN UINTN BuzzUs,
+  IN UINTN PauseUs
   )
 {
   EFI_SPMI_PROTOCOL *Spmi = NULL;
   EFI_STATUS         Status;
-  UINTN              Buzzes;
   UINTN              Idx;
 
   Status = gBS->LocateProtocol (&mQcomSpmiProtocolGuid, NULL, (VOID **)&Spmi);
@@ -511,19 +617,16 @@ VibrateFeedback (
     return;
   }
 
-  // Success: 1 short buzz. Failure: 3 short buzzes.
-  Buzzes = Success ? 1 : 3;
   for (Idx = 0; Idx < Buzzes; Idx++) {
-    if (EFI_ERROR (VibrateOnce (Spmi, HAP_BUZZ_US))) {
+    if (EFI_ERROR (VibrateOnce (Spmi, BuzzUs))) {
       DEBUG ((EFI_D_WARN, "KmDeviceStateApp: vibration write failed (non-fatal)\n"));
       break;
     }
     if (Idx + 1 < Buzzes) {
-      gBS->Stall (HAP_PAUSE_US);
+      gBS->Stall (PauseUs);
     }
   }
-  DEBUG ((EFI_D_INFO, "KmDeviceStateApp: vibration feedback done (%a)\n",
-          Success ? "SUCCESS" : "FAILED"));
+  DEBUG ((EFI_D_INFO, "KmDeviceStateApp: vibration sequence done (%u buzzes)\n", (UINTN)Buzzes));
 }
 
 // ---------------------------------------------------------------------------
@@ -540,6 +643,24 @@ KmDeviceStateAppEntry (
 
   DEBUG ((EFI_D_INFO, "KmDeviceStateApp: start (DXE auto-run)\n"));
 
+#if KM_DIAGNOSTIC_ONLY
+  // Conservative diagnostic build (user request 2026-08-08): READ-only.
+  //  1 buzz = driver loaded (and SPMI path works)
+  //  2 buzz = RPMB DeviceInfo magic found (flag location confirmed)
+  //  3 buzz = read failed / magic not found
+  VibrateSequence (1, HAP_BUZZ_US, 0);
+
+  Status = ProbeRpmbDeviceState ();
+  if (!EFI_ERROR (Status)) {
+    VibrateSequence (2, HAP_BUZZ_US, HAP_PAUSE_US);
+    DEBUG ((EFI_D_INFO, "KmDeviceStateApp: DIAGNOSTIC OK - flag location confirmed, no write performed\n"));
+    Status = EFI_SUCCESS;
+  } else {
+    VibrateSequence (3, HAP_BUZZ_US, HAP_PAUSE_US);
+    DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: DIAGNOSTIC FAILED: %r (no write performed)\n", Status));
+  }
+  return Status;
+#else
   // Prefer the direct-TA path (only depends on Qseecom protocol).
   Status = UnlockViaQseecom ();
   if (EFI_ERROR (Status)) {
@@ -554,6 +675,7 @@ KmDeviceStateAppEntry (
   }
 
   // Best-effort physical feedback; never affects the unlock result.
-  VibrateFeedback (!EFI_ERROR (Status));
+  VibrateSequence (EFI_ERROR (Status) ? 3 : 1, HAP_BUZZ_US, HAP_PAUSE_US);
   return Status;
+#endif
 }
