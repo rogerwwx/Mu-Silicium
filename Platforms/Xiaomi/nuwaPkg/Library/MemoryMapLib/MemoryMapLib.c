@@ -18,11 +18,14 @@ gMemoryDescriptor[] = {
   {"Display Demura",     0xA2A80000, 0x02B00000, AddMem, MEM_RES, SYS_MEM_CAP, Reserv, WRITE_THROUGH_XN},
   {"DBI Dump",           0xA6100000, 0x00F00000, NoHob,  MMAP_IO, INITIALIZED, Conv,   UNCACHED_UNBUFFERED_XN},
   // Split FD Reserved into I/II to match the real SM8550 layout (see K70
-  // kernel memory map). GetXblHobAddresses() scans for the exact name
-  // "FD Reserved"; a merged 6 MiB region made it scan 0xA7400000+ and take a
-  // synchronous data abort at 0xBAB01B70 (SEC, XblProtocols.c). With the
-  // split names the scan is skipped, same as the working K70 kernel.
-  {"FD Reserved I",      0xA7000000, 0x00400000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK},
+  // kernel memory map). GetXblHobAddresses() scans the region named exactly
+  // "FD Reserved" for the XBL HOB-registration function to recover the
+  // Scheduler Interface / DTB Extension addresses (EnvDxe constructor needs
+  // the Scheduler Interface HOB). The first region keeps the exact name with
+  // the real 4 MiB size so the scan stays within readable XBL FD memory; the
+  // second region is named separately so the scan stops at 0xA7400000 (a
+  // merged 6 MiB region used to make the scan abort at 0xBAB01B70).
+  {"FD Reserved",        0xA7000000, 0x00400000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK},
   {"FD Reserved II",     0xA7400000, 0x00200000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK},
   {"CPU Vectors",        0xA7600000, 0x00001000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK},
   {"Info Blk",           0xA7601000, 0x00001000, AddMem, SYS_MEM, SYS_MEM_CAP, RtData, WRITE_BACK_XN},
