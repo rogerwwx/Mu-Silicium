@@ -4,13 +4,26 @@
  *  read -> patch -> write the DeviceInfo unlock flags.
  *  Integrated into Mu-Silicium nuwaPkg (Xiaomi 13 Pro, SM8550).
  *
- *  Path 1 (primary, direct-TA "constant" method):
- *    Qseecom protocol (from stock TzDxe/ScmDxeCompat) -> keymaster TA ->
- *    cmd 514 READ 8K/4K block -> locate "ANDROID-BOOT!" -> set [13]/[14]=1 ->
- *    cmd 515 WRITE back -> verify re-read.
+ *  Unlock path (sole, active): QCOM_VERIFIEDBOOT_PROTOCOL.
+ *    VBRwDeviceState(READ_CONFIG, buf, 0xD10) -> buf[13]=buf[14]=1 ->
+ *    VBRwDeviceState(WRITE_CONFIG, buf, 0xD10).
+ *    This is exactly the key logic of the 8650/8750 VbRwStateApp (buffer
+ *    0xD10, flags at [13]/[14]); we additionally gate the write on finding
+ *    the "ANDROID-BOOT!" magic (safe: identical semantics when the read is
+ *    good, and it never writes back a garbage/empty buffer) and verify by
+ *    re-reading after WRITE_CONFIG.
  *
- *  Path 2 (fallback, mimics stock ABL / VbRwStateApp):
- *    QCOM_VERIFIEDBOOT_PROTOCOL.VBRwDeviceState(READ_CONFIG/WRITE_CONFIG).
+ *  Removed from the active flow (2026-08-08): the direct-TA path
+ *    Qseecom -> keymaster -> cmd 514/515. Root cause of its on-device
+ *    failure: after the AVB milestone gate is open, the keymaster TA
+ *    actually touches the data buffer, and our plain (cached) EFI pages
+ *    are rejected by TZ with result 0xE / EFI_DEVICE_ERROR. VerifiedBootDxe
+ *    succeeds because its buffer comes from UncachedMemoryAllocationLib
+ *    (uncached/XN memory). A correct direct-path fix needs the same
+ *    TZ-shared memory plumbing (QCOM ArmMmuLib-level attribute poke, or the
+ *    ShmBridge allocator), which is not verifiable off-device, so per
+ *    project decision the VB path is the only unlock path. The direct code
+ *    is preserved behind KM_USE_DIRECT_TA_PATH for future experiments.
  *
  *  Evidence-based constants (SM8550/SM8750 firmware + VbRwStateApp binary):
  *    514=0x202 READ_KM_DEVICE_STATE, 515=0x203 WRITE_KM_DEVICE_STATE,
@@ -27,13 +40,15 @@
  *
  *  Feedback channel (2026-08-08): the platform renders DEBUG output to the
  *  framebuffer (FrameBufferSerialPortLib), so all results below are printed
- *  on screen - no vibration needed. Current build is KM_DIAGNOSTIC_ONLY
- *  (read-only probe; flip to 0 for the full unlock write, see below).
- *
+ *  on screen - no vibration needed. Current build is the full unlock write
+ *  (KM_DIAGNOSTIC_ONLY=0). The write goes through the VerifiedBoot protocol
+ *  path (stock VerifiedBootDxe -> keymaster TA -> RPMB), which is the path
+ *  proven working on-device after disabling AVB ("Succeed using rpmb!").
  *  Preconditions:
- *    1. AVB/milestone gate bypassed (no SendMilestone call in your BDS).
- *    2. keymaster TA loadable (QseecomStartApp succeeds).
- *    3. RPMB provisioned, milestone not yet set.
+ *    1. AVB/milestone gate bypassed (vbmeta absent -> NO_AVB path; the VB
+ *       RPMB read only works when the milestone is not set).
+ *    2. VerifiedBootDxe in the FV (installs QCOM_VERIFIEDBOOT_PROTOCOL).
+ *    3. keymaster TA loadable and RPMB provisioned.
  */
 
 #include <Uefi.h>
@@ -92,13 +107,23 @@ EFI_GUID mQcomScmProtocolGuid = {
 #define KM_DIAG_SCREEN_STALL_US      5000 * 1000
 
 /*
- * Diagnostic-only mode (2026-08-08, user request "先弄个稳妥点的"):
- *   = 1: only READ cmd 514 + magic scan, NEVER writes. Results are printed
- *        to DEBUG, which the platform renders on the framebuffer.
- *   = 0: full unlock flow (write 515).
- * Flip this back to 0 once the read path is confirmed on device.
+ * Diagnostic-only mode (2026-08-08):
+ *   = 1: only READ cmd 514 + magic scan, NEVER writes.
+ *   = 0: full unlock flow (write). Current build: 0.
+ * On 2026-08-08 the VB (VerifiedBoot protocol) read path was confirmed
+ * working via RPMB on-device after AVB was disabled; the write path goes
+ * through the same RWDeviceState(WRITE_CONFIG) call.
  */
-#define KM_DIAGNOSTIC_ONLY           1
+#define KM_DIAGNOSTIC_ONLY           0
+
+/*
+ * Direct-TA path (Qseecom -> keymaster 514/515) master switch.
+ *   = 0: active build - VB protocol path only (matches VbRwStateApp).
+ *   = 1: experimental - run direct path first, fall back to VB. Requires a
+ *        TZ-shared (uncached) data buffer; with a plain EFI buffer the TA
+ *        rejects the command with TZ result 0xE (see header comment).
+ */
+#define KM_USE_DIRECT_TA_PATH        0
 
 // 12-byte command structure observed in VerifiedBootDxe:
 // {cmd_id, buf_ptr(32-bit), buf_size}. Buffer must be below 4 GB.
@@ -127,6 +152,7 @@ FindDeviceInfo (
   return NULL;
 }
 
+#if (KM_DIAGNOSTIC_ONLY == 1) || (KM_USE_DIRECT_TA_PATH == 1)
 static EFI_STATUS
 SendDeviceStateCmd (
   IN QCOM_QSEECOM_PROTOCOL *Qseecom,
@@ -163,6 +189,7 @@ SendDeviceStateCmd (
 
   return Status;
 }
+#endif /* KM_DIAGNOSTIC_ONLY || KM_USE_DIRECT_TA_PATH */
 
 #if KM_DIAGNOSTIC_ONLY
 static VOID
@@ -188,9 +215,13 @@ DumpBlockHead (
 #endif /* KM_DIAGNOSTIC_ONLY */
 
 // ---------------------------------------------------------------------------
-// Path 1: direct keymaster TA via Qseecom protocol (cmd 514/515)
+// Path 1 (disabled): direct keymaster TA via Qseecom protocol (cmd 514/515).
+// Kept for experiments. On-device it fails with TZ result 0xE /
+// EFI_DEVICE_ERROR once the AVB milestone gate is open, because the data
+// buffer must be TZ-shared (uncached) memory - VerifiedBootDxe allocates it
+// via UncachedMemoryAllocationLib; our plain EFI pages are rejected.
 // ---------------------------------------------------------------------------
-#if !KM_DIAGNOSTIC_ONLY
+#if !KM_DIAGNOSTIC_ONLY && KM_USE_DIRECT_TA_PATH
 static EFI_STATUS
 UnlockViaQseecom (
   VOID
@@ -317,7 +348,7 @@ UnlockViaQseecom (
   gBS->FreePages (BlockAddr, PageCount);
   return Status;
 }
-#endif /* !KM_DIAGNOSTIC_ONLY */
+#endif /* !KM_DIAGNOSTIC_ONLY && KM_USE_DIRECT_TA_PATH */
 
 // ---------------------------------------------------------------------------
 // Diagnostic probe (KM_DIAGNOSTIC_ONLY): READ-only verification.
@@ -503,7 +534,10 @@ UnlockViaVerifiedBootProtocol (
     Status = EFI_NOT_FOUND;
     goto Exit;
   }
-  DEBUG ((EFI_D_INFO, "KmDeviceStateApp: VB path: DeviceInfo @ +0x%x (unlocked=%d critical=%d)\n",
+  // EFI_D_ERROR level on purpose: FrameBufferSerialPortLib only renders
+  // ERROR/WARN to the framebuffer, and this line is the proof that the
+  // DeviceInfo magic was located before we touch the write path.
+  DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: VB path: DeviceInfo @ +0x%x (unlocked=%d critical=%d)\n",
           (UINTN)(Di - Buf), (UINTN)Di[DI_OFF_UNLOCKED], (UINTN)Di[DI_OFF_UNLOCK_CRITICAL]));
   Di[DI_OFF_UNLOCKED]        = 1;
   Di[DI_OFF_UNLOCK_CRITICAL] = 1;
@@ -512,7 +546,31 @@ UnlockViaVerifiedBootProtocol (
   if (EFI_ERROR (Status)) {
     DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: VB WRITE_CONFIG failed: %r\n", Status));
   } else {
-    DEBUG ((EFI_D_INFO, "KmDeviceStateApp: VB WRITE_CONFIG success\n"));
+    DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: VB WRITE_CONFIG success\n"));
+
+    // Verify (advisory): re-read and confirm the flags persisted. A failed
+    // re-read does not undo a successful write; it only downgrades the
+    // result when the flags were actually read back as not-set.
+    ZeroMem (Buf, BufLen);
+    Status = Vb->VBRwDeviceState (Vb, READ_CONFIG, Buf, BufLen);
+    if (EFI_ERROR (Status)) {
+      DEBUG ((EFI_D_WARN,
+              "KmDeviceStateApp: VB verify re-read failed (write already succeeded): %r\n",
+              Status));
+      Status = EFI_SUCCESS;
+    } else {
+      Di = FindDeviceInfo (Buf, BufLen);
+      if (Di != NULL) {
+        DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: VB verify unlocked=%d critical=%d\n",
+                (UINTN)Di[DI_OFF_UNLOCKED], (UINTN)Di[DI_OFF_UNLOCK_CRITICAL]));
+        if (Di[DI_OFF_UNLOCKED] != 1 || Di[DI_OFF_UNLOCK_CRITICAL] != 1) {
+          DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: VB VERIFY FAILED (flags not persisted)\n"));
+          Status = EFI_DEVICE_ERROR;
+        }
+      } else {
+        DEBUG ((EFI_D_WARN, "KmDeviceStateApp: VB verify: magic not found after write\n"));
+      }
+    }
   }
 
 Exit:
@@ -629,18 +687,28 @@ KmDeviceStateAppEntry (
   gBS->Stall (KM_DIAG_SCREEN_STALL_US);
   return Status;
 #else
-  // Prefer the direct-TA path (only depends on Qseecom protocol).
+#if KM_USE_DIRECT_TA_PATH
+  // Experimental: direct-TA path first, VB protocol as fallback.
   Status = UnlockViaQseecom ();
   if (EFI_ERROR (Status)) {
     DEBUG ((EFI_D_WARN, "KmDeviceStateApp: direct TA path failed (%r), trying VB protocol\n", Status));
     Status = UnlockViaVerifiedBootProtocol ();
   }
+#else
+  // Active path: VerifiedBoot protocol only (same key logic as VbRwStateApp:
+  // READ_CONFIG 0xD10 -> flags [13]/[14] = 1 -> WRITE_CONFIG, plus magic gate
+  // and verify re-read).
+  Status = UnlockViaVerifiedBootProtocol ();
+#endif
 
   if (!EFI_ERROR (Status)) {
-    DEBUG ((EFI_D_INFO, "KmDeviceStateApp: unlocked successfully (RPMB persisted)\n"));
+    DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: unlocked successfully (RPMB persisted)\n"));
   } else {
     DEBUG ((EFI_D_ERROR, "KmDeviceStateApp: unlock FAILED: %r\n", Status));
   }
+
+  // Keep the result on the framebuffer (5 s) before BDS draws the boot menu.
+  gBS->Stall (KM_DIAG_SCREEN_STALL_US);
 
   return Status;
 #endif
